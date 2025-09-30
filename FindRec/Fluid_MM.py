@@ -5,6 +5,7 @@ from mamba_ssm import Mamba
 from recbole.model.abstract_recommender import SequentialRecommender
 from recbole.model.loss import BPRLoss
 import numpy as np
+import pdb
 
 class GradientReversal(torch.autograd.Function):
     @staticmethod
@@ -126,39 +127,55 @@ class MultiHeadCrossAttention(nn.Module):
         return x.permute(0, 2, 1, 3)
 
     def forward(self, image_features, text_features, attention_mask=None):
+        
         image_proj = self.image_projection(image_features)
         text_proj = self.text_projection(text_features)
         
-
         image_proj = F.normalize(image_proj, p=2, dim=-1)
         text_proj = F.normalize(text_proj, p=2, dim=-1)
         
-        image_heads = self.split_heads(image_proj)
+        image_heads = self.split_heads(image_proj)  # [B, num_heads, L, head_dim]
         text_heads = self.split_heads(text_proj)
         
+        # Prepare attention mask for MultiheadAttention
+        # MultiheadAttention expects [batch, seq_len] where True = ignore
         if attention_mask is not None:
-            attention_mask = ~attention_mask
+            # attention_mask is [B, L] with True = valid positions
+            # MultiheadAttention needs True = padding (positions to IGNORE)
+            # So invert it
+            key_padding_mask = ~attention_mask  # [B, L]
+        else:
+            key_padding_mask = None
         
         head_outputs = []
         for head_idx in range(self.num_heads):
-            curr_image = image_heads[:, head_idx] * self.scaling
+            curr_image = image_heads[:, head_idx] * self.scaling  # [B, L, head_dim]
             curr_text = text_heads[:, head_idx] * self.scaling
             
+            # MultiheadAttention expects input as [seq_len, batch, embed_dim]
+            # So we need to transpose
+            curr_image_t = curr_image.transpose(0, 1)  # [L, B, head_dim]
+            curr_text_t = curr_text.transpose(0, 1)    # [L, B, head_dim]
+            
             img2text, _ = self.image_to_text_heads[head_idx](
-                query=curr_image,
-                key=curr_text,
-                value=curr_text,
-                key_padding_mask=attention_mask
+                query=curr_image_t,  # [L, B, head_dim]
+                key=curr_text_t,
+                value=curr_text_t,
+                key_padding_mask=key_padding_mask  # [B, L]
             )
             
             text2img, _ = self.text_to_image_heads[head_idx](
-                query=curr_text,
-                key=curr_image,
-                value=curr_image,
-                key_padding_mask=attention_mask
+                query=curr_text_t,
+                key=curr_image_t,
+                value=curr_image_t,
+                key_padding_mask=key_padding_mask
             )
             
-
+            # Transpose back to [B, L, head_dim]
+            img2text = img2text.transpose(0, 1)
+            text2img = text2img.transpose(0, 1)
+            
+            # Residual connection
             img2text = curr_image + img2text
             text2img = curr_text + text2img
             
@@ -166,7 +183,6 @@ class MultiHeadCrossAttention(nn.Module):
             normalized = self.head_norms[head_idx](combined)
             head_outputs.append(normalized)
         
-
         # [batch_size, num_heads, seq_len, head_dim * 2]
         return torch.stack(head_outputs, dim=1)
 
@@ -377,83 +393,109 @@ class MultiViewEntropyBottleneck(nn.Module):
         return mu + eps * std
         
     def compute_kl_loss(self, mu1, logvar1, mu2, logvar2, mask=None):
+        # Clamp to prevent explosion
+        logvar1 = torch.clamp(logvar1, min=-10, max=2)
+        logvar2 = torch.clamp(logvar2, min=-10, max=2)
+        
         kl1 = -0.5 * torch.sum(1 + logvar1 - mu1.pow(2) - logvar1.exp(), dim=-1)  # [B, L]
         kl2 = -0.5 * torch.sum(1 + logvar2 - mu2.pow(2) - logvar2.exp(), dim=-1)  # [B, L]
         
         if mask is not None:
-            sequence_lengths = mask.sum(dim=1).long() - 1  # [B]
-            batch_indices = torch.arange(mask.size(0), device=mask.device)
-            kl1 = kl1[batch_indices, sequence_lengths]  # [B]
-            kl2 = kl2[batch_indices, sequence_lengths]  # [B]
+            # Ensure mask is [B, L]
+            if mask.shape != kl1.shape:
+                # If mask is [L, B], transpose it back
+                if mask.shape[0] == kl1.shape[1] and mask.shape[1] == kl1.shape[0]:
+                    mask = mask.t()  # [L, B] -> [B, L]
+                # If mask is [L, 1], squeeze and unsqueeze
+                elif mask.dim() == 2 and mask.shape[1] == 1:
+                    mask = mask.squeeze(1).unsqueeze(0)  # [L, 1] -> [L] -> [1, L]
             
-        return (kl1.mean() + kl2.mean()) / 2
+            # Now mask should be [B, L]
+            sequence_lengths = (mask.sum(dim=1) - 1).clamp(min=0).long()
+            batch_indices = torch.arange(kl1.size(0), device=kl1.device)
+            
+            kl1 = kl1[batch_indices, sequence_lengths]
+            kl2 = kl2[batch_indices, sequence_lengths]
         
+        avg_kld = (kl1.mean() + kl2.mean()) / 2.0
+        
+        if not torch.isfinite(avg_kld):
+            return torch.tensor(0.0, device=avg_kld.device, requires_grad=True)
+        
+        return avg_kld
+    
     def forward(self, image_features, text_features, attention_mask=None):
         """
         Args:
             image_features: [B, L, D1]
             text_features: [B, L, D1]
-            attention_mask: [B, L]
+            attention_mask: [B, L]  # Now correct!
         """
         batch_size = image_features.size(0)
         
- 
-        image_params = self.image_encoder(image_features)  # [B, L, D*2]
-        text_params = self.text_encoder(text_features)     # [B, L, D*2]
+        image_params = self.image_encoder(image_features)
+        text_params = self.text_encoder(text_features)
         
-
         image_mu, image_logvar = torch.chunk(image_params, 2, dim=-1)
         text_mu, text_logvar = torch.chunk(text_params, 2, dim=-1)
-
+        
+        # Clamp mu and logvar BEFORE reparameterization
+        image_mu = torch.clamp(image_mu, min=-5, max=5)
+        text_mu = torch.clamp(text_mu, min=-5, max=5)
+        image_logvar = torch.clamp(image_logvar, min=-10, max=2)
+        text_logvar = torch.clamp(text_logvar, min=-10, max=2)
+        
         image_z = self.reparameterize(image_mu, image_logvar)
         text_z = self.reparameterize(text_mu, text_logvar)
         
-        image_z = F.normalize(image_z, p=2, dim=-1)  # [B, L, D]
-        text_z = F.normalize(text_z, p=2, dim=-1)    # [B, L, D]
+        image_z = F.normalize(image_z, p=2, dim=-1)
+        text_z = F.normalize(text_z, p=2, dim=-1)
         
-
-        image_score = self.image_score(image_z)  # [B, L, D]
-        text_score = self.text_score(text_z)     # [B, L, D]
+        image_score = self.image_score(image_z)
+        text_score = self.text_score(text_z)
         
         if attention_mask is not None:
+            # Remove these lines:
+            # attention_mask = attention_mask.squeeze(-1).unsqueeze(0)
             
-            sequence_lengths = attention_mask.sum(dim=1).long() - 1  # [B]
+            # Instead, ensure it's [B, L]
+            if attention_mask.shape != image_z.shape[:2]:
+                if attention_mask.shape[0] == image_z.shape[1] and attention_mask.shape[1] == image_z.shape[0]:
+                    attention_mask = attention_mask.t()
+                elif attention_mask.dim() == 2 and attention_mask.shape[1] == 1:
+                    attention_mask = attention_mask.squeeze(1).unsqueeze(0)
+            
+            sequence_lengths = (attention_mask.sum(dim=1) - 1).clamp(min=0).long()
             batch_indices = torch.arange(batch_size, device=image_z.device)
             
-           
-            image_z_last = image_z[batch_indices, sequence_lengths]      # [B, D]
-            text_z_last = text_z[batch_indices, sequence_lengths]        # [B, D]
-            image_score_last = image_score[batch_indices, sequence_lengths]  # [B, D]
-            text_score_last = text_score[batch_indices, sequence_lengths]    # [B, D]
+            image_z_last = image_z[batch_indices, sequence_lengths]
+            # ... rest of the code
+            text_z_last = text_z[batch_indices, sequence_lengths]
+            image_score_last = image_score[batch_indices, sequence_lengths]
+            text_score_last = text_score[batch_indices, sequence_lengths]
         else:
-            
-            image_z_last = image_z[:, -1]        # [B, D]
-            text_z_last = text_z[:, -1]          # [B, D]
-            image_score_last = image_score[:, -1]  # [B, D]
-            text_score_last = text_score[:, -1]    # [B, D]
-        
+            image_z_last = image_z[:, -1]
+            text_z_last = text_z[:, -1]
+            image_score_last = image_score[:, -1]
+            text_score_last = text_score[:, -1]
         
         kernel_matrix = self.stein_kernel.score_kernel(
             image_z_last, image_score_last,
             text_z_last, text_score_last
-        )  # [B, B]
-        
+        )
         
         alignment_loss = torch.mean(kernel_matrix)
-        
-        
         kl_loss = self.compute_kl_loss(
             image_mu, image_logvar,
             text_mu, text_logvar,
-            attention_mask
+            attention_mask  # Now [B, L]
         )
-        
         
         total_loss = kl_loss + self.beta * alignment_loss
         
         return {
-            'image_repr': image_z,  # [B, L, D]
-            'text_repr': text_z,    # [B, L, D]
+            'image_repr': image_z,
+            'text_repr': text_z,
             'alignment_loss': alignment_loss,
             'kl_loss': kl_loss,
             'total_loss': total_loss
@@ -556,7 +598,7 @@ class MultiModalMoERec(SequentialRecommender):
         
         
         attention_mask = torch.from_numpy(mask).bool().to(self.device)
-        attention_mask = attention_mask.transpose(0, 1)  
+        #attention_mask = attention_mask.transpose(0, 1)  
         indices = torch.from_numpy(indices).to(self.device)
         
         image_features = self.image_features[indices]
